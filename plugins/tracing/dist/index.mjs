@@ -46762,6 +46762,35 @@ function parseSession(lines) {
 				};
 				s.toolCalls.push(tc);
 				toolCallsById.set(tc.callId, tc);
+			} else if (p.type === "local_shell_call") {
+				const call = p;
+				const s = ensureStep(ts);
+				const tc = {
+					callId: call.call_id ?? call.id ?? `local_shell_${ts}_${s.toolCalls.length}`,
+					name: "local_shell",
+					args: call.action ?? void 0,
+					startTime: ts
+				};
+				s.toolCalls.push(tc);
+				toolCallsById.set(tc.callId, tc);
+			} else if (p.type === "web_search_call") {
+				const call = p;
+				const callId = call.id ?? `web_search_${ts}`;
+				const existing = toolCallsById.get(callId);
+				if (existing) {
+					existing.args = existing.args ?? call.action ?? void 0;
+					existing.endTime = Math.max(existing.endTime ?? ts, ts);
+				} else {
+					const s = ensureStep(ts);
+					const tc = {
+						callId,
+						name: "web_search",
+						args: call.action ?? void 0,
+						startTime: ts
+					};
+					s.toolCalls.push(tc);
+					toolCallsById.set(callId, tc);
+				}
 			} else if (p.type === "function_call_output" || p.type === "custom_tool_call_output") {
 				const out = p;
 				const tc = toolCallsById.get(out.call_id);
@@ -46807,6 +46836,28 @@ function parseSession(lines) {
 			});
 			else {
 				if (et === "collab_agent_spawn_end" && typeof p.new_thread_id === "string") turn.subagentThreadIds.push(p.new_thread_id);
+				if ((et === "mcp_tool_call_begin" || et === "mcp_tool_call_end") && typeof p.call_id === "string") {
+					const tc = toolCallsById.get(p.call_id);
+					const inv = p.invocation;
+					if (tc && typeof inv?.server === "string" && typeof inv?.tool === "string") tc.mcp = {
+						server: inv.server,
+						tool: inv.tool
+					};
+				}
+				if (et === "web_search_end" && typeof p.call_id === "string") {
+					let tc = toolCallsById.get(p.call_id);
+					if (!tc) {
+						tc = {
+							callId: p.call_id,
+							name: "web_search",
+							args: void 0,
+							startTime: ts
+						};
+						ensureStep(ts).toolCalls.push(tc);
+						toolCallsById.set(tc.callId, tc);
+					}
+					tc.args = tc.args ?? p.action ?? (typeof p.query === "string" ? { query: p.query } : void 0);
+				}
 				if (typeof p.call_id === "string" && et.endsWith("_end")) {
 					const tc = toolCallsById.get(p.call_id);
 					if (tc) {
@@ -46960,10 +47011,56 @@ function buildGenerationOutput(step, clip) {
 	}));
 	return Object.keys(output).length > 0 ? output : void 0;
 }
+/** Tools that execute a shell command; the command makes a better span name. */
+const SHELL_TOOL_NAMES = new Set([
+	"shell",
+	"exec_command",
+	"local_shell",
+	"container.exec"
+]);
+/** Collapse a value to a short single line usable inside a span name. */
+function previewText(value, max = 60) {
+	const oneLine = value.trim().replace(/\s+/g, " ");
+	return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+}
+function extractCommandText(args) {
+	if (args == null || typeof args !== "object") return void 0;
+	const cmd = args.command ?? args.cmd;
+	if (typeof cmd === "string" && cmd.trim()) return cmd;
+	if (Array.isArray(cmd) && cmd.length > 0 && cmd.every((c) => typeof c === "string")) {
+		const parts = cmd;
+		if (parts.length === 3 && /^(ba|z|fi)?sh$/.test(parts[0]) && /^-l?c$/.test(parts[1])) return parts[2];
+		return parts.join(" ");
+	}
+}
+/**
+* Observation name for a tool call: the tool name enriched with what it was
+* called with (shell command, search query, MCP server/tool), so the trace
+* tree shows *what* ran, not just which tool.
+*/
+function toolObservationName(tc) {
+	if (tc.mcp) return `${tc.mcp.server}.${tc.mcp.tool}`;
+	const name = tc.name || "tool";
+	if (SHELL_TOOL_NAMES.has(name)) {
+		const command = extractCommandText(tc.args);
+		if (command) return `${name}: ${previewText(command)}`;
+	}
+	if (name === "web_search" && tc.args != null && typeof tc.args === "object") {
+		const a = tc.args;
+		const detail = [
+			a.query,
+			a.url,
+			a.pattern
+		].find((v) => typeof v === "string" && v);
+		if (detail) return `${name}: ${previewText(detail)}`;
+	}
+	return name;
+}
 /** Emit a single turn (and its subagents) as a Langfuse observation tree. */
 async function emitTurn(turn, sessionMeta, ctx) {
 	const clip = makeClip(ctx.config.max_chars);
-	const root = startObservation("Codex Turn", {
+	const isSubagent = sessionMeta.isSubagentThread === true || ctx.parentObservation != null;
+	const root = startObservation(isSubagent ? "Codex Subagent Turn" : "Codex Turn", {
 		input: turn.userInput != null ? clip(turn.userInput) : void 0,
 		output: turn.finalOutput != null ? clip(turn.finalOutput) : void 0,
 		level: turn.aborted ? "WARNING" : void 0,
@@ -46985,7 +47082,7 @@ async function emitTurn(turn, sessionMeta, ctx) {
 	let previousToolResults = void 0;
 	for (let i = 0; i < turn.steps.length; i++) {
 		const step = turn.steps[i];
-		const generation = startObservation(turn.model ?? "codex.generation", {
+		const generation = startObservation(isSubagent ? "LLM Subagent" : "LLM", {
 			input: i === 0 ? turn.userInput != null ? clip(turn.userInput) : void 0 : previousToolResults,
 			output: buildGenerationOutput(step, clip),
 			model: turn.model,
@@ -47018,12 +47115,15 @@ async function emitTurn(turn, sessionMeta, ctx) {
 	root.end(new Date(turn.endTime));
 }
 function emitToolCall(tc, parent, clip, fallbackEnd) {
-	startObservation(tc.name || "tool", {
+	startObservation(toolObservationName(tc), {
 		input: tc.args,
 		output: tc.output != null ? clip(toText(tc.output)) : void 0,
 		level: tc.error ? "ERROR" : void 0,
 		statusMessage: tc.error ? clip(tc.error) : void 0,
-		metadata: { "codex.call_id": tc.callId }
+		metadata: {
+			"codex.call_id": tc.callId,
+			"codex.tool_name": tc.name || "tool"
+		}
 	}, {
 		asType: "tool",
 		startTime: new Date(tc.startTime),
@@ -47055,7 +47155,7 @@ async function convertRollout(rolloutFile, options) {
 		const seededParent = await seededTraceParent(options.config, sessionMeta, turnIndex + 1);
 		await propagateAttributes({
 			sessionId: sessionMeta.sessionId,
-			traceName: "Codex Turn",
+			traceName: sessionMeta.isSubagentThread ? "Codex Subagent Turn" : "Codex Turn",
 			...options.config.user_id ? { userId: options.config.user_id } : {},
 			...options.config.tags ? { tags: options.config.tags } : {},
 			...options.config.metadata ? { metadata: options.config.metadata } : {}

@@ -155,6 +155,51 @@ function buildGenerationOutput(step: ModelStep, clip: Clip): Record<string, unkn
   return Object.keys(output).length > 0 ? output : undefined;
 }
 
+/** Tools that execute a shell command; the command makes a better span name. */
+const SHELL_TOOL_NAMES = new Set(["shell", "exec_command", "local_shell", "container.exec"]);
+
+/** Collapse a value to a short single line usable inside a span name. */
+function previewText(value: string, max = 60): string {
+  const oneLine = value.trim().replace(/\s+/g, " ");
+  return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+}
+
+function extractCommandText(args: unknown): string | undefined {
+  if (args == null || typeof args !== "object") return undefined;
+  const cmd =
+    (args as { command?: unknown; cmd?: unknown }).command ?? (args as { cmd?: unknown }).cmd;
+  if (typeof cmd === "string" && cmd.trim()) return cmd;
+  if (Array.isArray(cmd) && cmd.length > 0 && cmd.every((c) => typeof c === "string")) {
+    const parts = cmd as string[];
+    // Codex wraps most commands as ["bash", "-lc", "<script>"]; show the script.
+    if (parts.length === 3 && /^(ba|z|fi)?sh$/.test(parts[0]) && /^-l?c$/.test(parts[1])) {
+      return parts[2];
+    }
+    return parts.join(" ");
+  }
+  return undefined;
+}
+
+/**
+ * Observation name for a tool call: the tool name enriched with what it was
+ * called with (shell command, search query, MCP server/tool), so the trace
+ * tree shows *what* ran, not just which tool.
+ */
+function toolObservationName(tc: ToolCall): string {
+  if (tc.mcp) return `${tc.mcp.server}.${tc.mcp.tool}`;
+  const name = tc.name || "tool";
+  if (SHELL_TOOL_NAMES.has(name)) {
+    const command = extractCommandText(tc.args);
+    if (command) return `${name}: ${previewText(command)}`;
+  }
+  if (name === "web_search" && tc.args != null && typeof tc.args === "object") {
+    const a = tc.args as { query?: unknown; url?: unknown; pattern?: unknown };
+    const detail = [a.query, a.url, a.pattern].find((v) => typeof v === "string" && v);
+    if (detail) return `${name}: ${previewText(detail as string)}`;
+  }
+  return name;
+}
+
 /** Emit a single turn (and its subagents) as a Langfuse observation tree. */
 async function emitTurn(
   turn: Turn,
@@ -169,8 +214,12 @@ async function emitTurn(
 ): Promise<void> {
   const clip = makeClip(ctx.config.max_chars);
 
+  // A turn belongs to a subagent when its rollout is marked as a subagent
+  // thread or when it is being nested under a spawning turn.
+  const isSubagent = sessionMeta.isSubagentThread === true || ctx.parentObservation != null;
+
   const root = startObservation(
-    "Codex Turn",
+    isSubagent ? "Codex Subagent Turn" : "Codex Turn",
     {
       input: turn.userInput != null ? clip(turn.userInput) : undefined,
       output: turn.finalOutput != null ? clip(turn.finalOutput) : undefined,
@@ -198,7 +247,7 @@ async function emitTurn(
   for (let i = 0; i < turn.steps.length; i++) {
     const step = turn.steps[i];
     const generation = startObservation(
-      turn.model ?? "codex.generation",
+      isSubagent ? "LLM Subagent" : "LLM",
       {
         input:
           i === 0
@@ -254,13 +303,13 @@ function emitToolCall(
   fallbackEnd: number,
 ): void {
   const tool = startObservation(
-    tc.name || "tool",
+    toolObservationName(tc),
     {
       input: tc.args,
       output: tc.output != null ? clip(toText(tc.output)) : undefined,
       level: tc.error ? "ERROR" : undefined,
       statusMessage: tc.error ? clip(tc.error) : undefined,
-      metadata: { "codex.call_id": tc.callId },
+      metadata: { "codex.call_id": tc.callId, "codex.tool_name": tc.name || "tool" },
     },
     {
       asType: "tool",
@@ -312,7 +361,7 @@ export async function convertRollout(
     await propagateAttributes(
       {
         sessionId: sessionMeta.sessionId,
-        traceName: "Codex Turn",
+        traceName: sessionMeta.isSubagentThread ? "Codex Subagent Turn" : "Codex Turn",
         ...(options.config.user_id ? { userId: options.config.user_id } : {}),
         ...(options.config.tags ? { tags: options.config.tags } : {}),
         ...(options.config.metadata ? { metadata: options.config.metadata } : {}),
