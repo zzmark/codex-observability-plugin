@@ -9,9 +9,9 @@ Once enabled, every Codex turn shows up in Langfuse as a trace you can inspect, 
 After each Codex turn, the plugin reads the session's rollout transcript and uploads it to Langfuse as a [trace](https://langfuse.com/docs/observability/data-model). The structure mirrors how Codex actually works:
 
 - **Turn** (`Codex Turn`, an [agent observation](https://langfuse.com/docs/observability/features/observation-types)) — one trace per turn, from your prompt to the final answer.
-- **Generations** — one per model response within the turn, with the model name, reasoning, assistant text, the tool calls it requested, and token usage.
-- **Tool calls** — `exec_command`, `apply_patch`, `spawn_agent`, MCP tools, web search, etc., each with its input, output, and error status. Failed commands are flagged as errors.
-- **Subagents** — subagent threads are resolved from their own rollout files and nested under the spawning turn.
+- **Generations** — one per model response within the turn, named `LLM` (or `LLM Subagent` inside subagent threads), with the model recorded on the observation plus reasoning, assistant text, the tool calls it requested, and token usage.
+- **Tool calls** — shell commands, `apply_patch`, `spawn_agent`, MCP tools, web searches, etc., each with its input, output, and error status. Observation names include what was called — the shell command (`exec_command: git status`), the search query (`web_search: …`), or the MCP server and tool (`server.tool`) — and failed commands are flagged as errors.
+- **Subagents** — subagent threads are resolved from their own rollout files and nested under the spawning turn as `Codex Subagent Turn`.
 - **Sessions** — all turns from one Codex session are grouped via the Codex thread id, so you can replay the whole session in Langfuse's [Sessions](https://langfuse.com/docs/observability/features/sessions) view.
 
 Interrupted turns (where you cancel mid-response) are still uploaded and flagged as interrupted.

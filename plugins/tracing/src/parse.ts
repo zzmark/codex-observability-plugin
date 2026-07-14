@@ -5,7 +5,9 @@ import type {
   ResponseItemFunctionCall,
   ResponseItemFunctionCallOutput,
   ResponseItemCustomToolCall,
+  ResponseItemLocalShellCall,
   ResponseItemMessage,
+  ResponseItemWebSearchCall,
   RolloutLine,
   SessionMeta,
   TokenUsage,
@@ -224,6 +226,41 @@ export function parseSession(lines: RolloutLine[]): {
         };
         s.toolCalls.push(tc);
         toolCallsById.set(tc.callId, tc);
+      } else if (p.type === "local_shell_call") {
+        // Built-in local shell tool: the command lives in `action`, and
+        // exec_command_end / function_call_output enrich it like any function
+        // call.
+        const call = p as unknown as ResponseItemLocalShellCall;
+        const s = ensureStep(ts);
+        const tc: ToolCall = {
+          callId: call.call_id ?? call.id ?? `local_shell_${ts}_${s.toolCalls.length}`,
+          name: "local_shell",
+          args: call.action ?? undefined,
+          startTime: ts,
+        };
+        s.toolCalls.push(tc);
+        toolCallsById.set(tc.callId, tc);
+      } else if (p.type === "web_search_call") {
+        // Server-side web search: there is no output item, and the
+        // web_search_end event may be recorded before or after this item, so
+        // merge with an existing call when one was already registered.
+        const call = p as unknown as ResponseItemWebSearchCall;
+        const callId = call.id ?? `web_search_${ts}`;
+        const existing = toolCallsById.get(callId);
+        if (existing) {
+          existing.args = existing.args ?? call.action ?? undefined;
+          existing.endTime = Math.max(existing.endTime ?? ts, ts);
+        } else {
+          const s = ensureStep(ts);
+          const tc: ToolCall = {
+            callId,
+            name: "web_search",
+            args: call.action ?? undefined,
+            startTime: ts,
+          };
+          s.toolCalls.push(tc);
+          toolCallsById.set(callId, tc);
+        }
       } else if (p.type === "function_call_output" || p.type === "custom_tool_call_output") {
         const out = p as unknown as ResponseItemFunctionCallOutput;
         const tc = toolCallsById.get(out.call_id);
@@ -272,6 +309,32 @@ export function parseSession(lines: RolloutLine[]): {
         // call_id ending in "_end") enriches the spawning tool call below.
         if (et === "collab_agent_spawn_end" && typeof p.new_thread_id === "string") {
           turn!.subagentThreadIds.push(p.new_thread_id);
+        }
+        // MCP tool calls are function calls with a mangled name
+        // (`server__tool`); the begin/end events carry the clean server/tool
+        // split, which makes a much better observation name.
+        if (
+          (et === "mcp_tool_call_begin" || et === "mcp_tool_call_end") &&
+          typeof p.call_id === "string"
+        ) {
+          const tc = toolCallsById.get(p.call_id);
+          const inv = p.invocation;
+          if (tc && typeof inv?.server === "string" && typeof inv?.tool === "string") {
+            tc.mcp = { server: inv.server, tool: inv.tool };
+          }
+        }
+        // Web searches run server-side inside the model response. The end
+        // event can be recorded before the web_search_call response item, so
+        // register the call here if it is not known yet.
+        if (et === "web_search_end" && typeof p.call_id === "string") {
+          let tc = toolCallsById.get(p.call_id);
+          if (!tc) {
+            tc = { callId: p.call_id, name: "web_search", args: undefined, startTime: ts };
+            ensureStep(ts).toolCalls.push(tc);
+            toolCallsById.set(tc.callId, tc);
+          }
+          tc.args =
+            tc.args ?? p.action ?? (typeof p.query === "string" ? { query: p.query } : undefined);
         }
         // Tool execution lifecycle events (exec_command_end, patch_apply_end,
         // mcp_tool_call_end, collab_*_end, …) match a call by id and add

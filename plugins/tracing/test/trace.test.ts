@@ -83,10 +83,12 @@ describe("convertRollout", () => {
     // Backdated to the turn's task_started timestamp.
     expect(startMs(root!)).toBe(Date.parse("2026-06-03T10:00:01.000Z"));
 
-    // Two generations, both children of the root.
+    // Two generations, both children of the root, named "LLM" (the model name
+    // lives in the model attribute, not the observation name).
     const generations = spans.filter((s) => obsType(s) === "generation");
     expect(generations).toHaveLength(2);
     for (const gen of generations) {
+      expect(gen.name).toBe("LLM");
       expect(parentId(gen)).toBe(root!.spanContext().spanId);
       expect(attr(gen, "langfuse.observation.model.name")).toBe("gpt-5.4");
     }
@@ -99,7 +101,8 @@ describe("convertRollout", () => {
     // One tool span, nested under a generation, with the captured command output.
     const tools = spans.filter((s) => obsType(s) === "tool");
     expect(tools).toHaveLength(1);
-    expect(tools[0].name).toBe("exec_command");
+    expect(tools[0].name).toBe("exec_command: ls");
+    expect(attr(tools[0], "langfuse.observation.metadata.codex.tool_name")).toBe("exec_command");
     expect(attr(tools[0], "langfuse.observation.output")).toContain("file1.txt");
     expect(generations.map((g) => g.spanContext().spanId)).toContain(parentId(tools[0]));
   });
@@ -109,18 +112,22 @@ describe("convertRollout", () => {
     await convertRollout(path.join(dir, "rollout-parent.jsonl"), { config: baseConfig });
 
     const spans = exporter.getFinishedSpans();
-    const turnRoots = spans.filter((s) => s.name === "Codex Turn" && obsType(s) === "agent");
-    // Parent turn + nested subagent turn.
-    expect(turnRoots).toHaveLength(2);
-
-    const parent = turnRoots.find((s) => parentId(s) === undefined);
-    const child = turnRoots.find((s) => parentId(s) !== undefined);
+    const parent = spans.find((s) => s.name === "Codex Turn" && obsType(s) === "agent");
+    const child = spans.find((s) => s.name === "Codex Subagent Turn" && obsType(s) === "agent");
     expect(parent).toBeDefined();
     expect(child).toBeDefined();
+    expect(parentId(parent!)).toBeUndefined();
+    expect(parentId(child!)).toBeDefined();
 
     // The subagent turn is nested somewhere under the parent's trace.
     expect(child!.spanContext().traceId).toBe(parent!.spanContext().traceId);
     expect(attr(child!, "langfuse.observation.input")).toContain("tell a joke");
+
+    // Subagent generations are distinguishable from main-thread ones.
+    const childGeneration = spans.find(
+      (s) => obsType(s) === "generation" && parentId(s) === child!.spanContext().spanId,
+    );
+    expect(childGeneration?.name).toBe("LLM Subagent");
 
     // Aborted turn is flagged on the parent root.
     expect(attr(parent!, "langfuse.observation.level")).toBe("WARNING");
@@ -131,6 +138,28 @@ describe("convertRollout", () => {
     );
     expect(failedTool, "expected a failed tool span").toBeDefined();
     expect(attr(failedTool!, "langfuse.observation.status_message")).toContain("command failed");
+  });
+
+  it("captures web search, local shell, and MCP tool calls with specific names", async () => {
+    const dir = stageFixtures();
+    await convertRollout(path.join(dir, "rollout-tools-main.jsonl"), { config: baseConfig });
+
+    const spans = exporter.getFinishedSpans();
+    const toolNames = spans
+      .filter((s) => obsType(s) === "tool")
+      .map((s) => s.name)
+      .sort();
+    expect(toolNames).toEqual([
+      "linear.create_issue",
+      "local_shell: git status",
+      "web_search: langfuse codex plugin",
+    ]);
+
+    const webSearch = spans.find((s) => s.name.startsWith("web_search"))!;
+    expect(attr(webSearch, "langfuse.observation.input")).toContain("langfuse codex plugin");
+
+    const shell = spans.find((s) => s.name.startsWith("local_shell"))!;
+    expect(attr(shell, "langfuse.observation.output")).toContain("clean");
   });
 
   it("skips turns already recorded in the sidecar (dedup)", async () => {
@@ -155,7 +184,7 @@ describe("deterministic trace ids (trace_seed)", () => {
   const turnRoots = () =>
     exporter
       .getFinishedSpans()
-      .filter((s) => s.name === "Codex Turn")
+      .filter((s) => s.name === "Codex Turn" || s.name === "Codex Subagent Turn")
       .sort((a, b) => startMs(a) - startMs(b));
 
   it("derives the N-th main-thread turn's trace id from `${seed}:${N}`", async () => {

@@ -63,6 +63,25 @@ export type ResponseItemCustomToolCallOutput = {
   output: unknown;
 };
 
+/** Server-side web search performed by the model (no separate output item). */
+export type ResponseItemWebSearchCall = {
+  type: "web_search_call";
+  id?: string | null;
+  status?: string | null;
+  /** `{ type: "search", query }`, `{ type: "open_page", url }`, … */
+  action?: Record<string, unknown> | null;
+};
+
+/** Shell execution for models using the built-in local shell tool. */
+export type ResponseItemLocalShellCall = {
+  type: "local_shell_call";
+  id?: string | null;
+  call_id?: string | null;
+  status?: string | null;
+  /** `{ type: "exec", command: string[], … }` */
+  action?: Record<string, unknown> | null;
+};
+
 export type ResponseItemReasoning = {
   type: "reasoning";
   summary?: unknown[];
@@ -81,6 +100,8 @@ export type ResponseItem =
   | ResponseItemFunctionCallOutput
   | ResponseItemCustomToolCall
   | ResponseItemCustomToolCallOutput
+  | ResponseItemWebSearchCall
+  | ResponseItemLocalShellCall
   | ResponseItemReasoning
   | ResponseItemOther;
 
@@ -109,6 +130,11 @@ export type EventMsgPayload = {
   } | null;
   /** collab_agent_spawn_end */
   new_thread_id?: string | null;
+  /** mcp_tool_call_begin / mcp_tool_call_end */
+  invocation?: { server?: string; tool?: string; arguments?: unknown } | null;
+  /** web_search_end */
+  query?: string;
+  action?: Record<string, unknown> | null;
   /** exec_command_end / patch_apply_end */
   status?: string;
   exit_code?: number;
@@ -158,6 +184,8 @@ export type ToolCall = {
   endTime?: number;
   output?: unknown;
   error?: string;
+  /** Server/tool split for MCP calls, taken from mcp_tool_call_* events. */
+  mcp?: { server: string; tool: string };
 };
 
 /** A single model response within a turn (one LLM call). */

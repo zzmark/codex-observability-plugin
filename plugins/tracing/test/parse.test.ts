@@ -153,6 +153,64 @@ describe("parseSession", () => {
     expect(turns[0].userInput).toBe("real question");
   });
 
+  it("captures web search, local shell, and MCP tool calls", () => {
+    const { turns } = parseSession(loadFixture("rollout-tools-main.jsonl"));
+
+    expect(turns).toHaveLength(1);
+    const tools = turns[0].steps.flatMap((s) => s.toolCalls);
+    expect(tools).toHaveLength(3);
+
+    // web_search_end (event) precedes the web_search_call item in the fixture;
+    // the two must merge into a single call.
+    const webSearch = tools.find((t) => t.name === "web_search");
+    expect(webSearch?.args).toEqual({ type: "search", query: "langfuse codex plugin" });
+    expect(webSearch?.endTime).toBe(Date.parse("2026-06-03T12:00:02.600Z"));
+
+    const shell = tools.find((t) => t.name === "local_shell");
+    expect(shell?.args).toMatchObject({ command: ["bash", "-lc", "git status"] });
+    expect(shell?.output).toBe("clean");
+
+    const mcp = tools.find((t) => t.name === "linear__create_issue");
+    expect(mcp?.mcp).toEqual({ server: "linear", tool: "create_issue" });
+  });
+
+  it("merges a web_search_call item with a later web_search_end event", () => {
+    const lines: RolloutLine[] = [
+      { timestamp: "2026-06-03T12:00:00.000Z", type: "session_meta", payload: { id: "s" } },
+      {
+        timestamp: "2026-06-03T12:00:01.000Z",
+        type: "event_msg",
+        payload: { type: "task_started", turn_id: "t" },
+      },
+      {
+        timestamp: "2026-06-03T12:00:02.000Z",
+        type: "response_item",
+        payload: {
+          type: "web_search_call",
+          id: "ws-1",
+          status: "completed",
+          action: { type: "search", query: "q" },
+        },
+      },
+      {
+        timestamp: "2026-06-03T12:00:02.500Z",
+        type: "event_msg",
+        payload: { type: "web_search_end", call_id: "ws-1", query: "q" },
+      },
+      {
+        timestamp: "2026-06-03T12:00:03.000Z",
+        type: "event_msg",
+        payload: { type: "task_complete", turn_id: "t" },
+      },
+    ];
+    const { turns } = parseSession(lines);
+    const tools = turns[0].steps.flatMap((s) => s.toolCalls);
+    expect(tools).toHaveLength(1);
+    expect(tools[0].name).toBe("web_search");
+    expect(tools[0].args).toEqual({ type: "search", query: "q" });
+    expect(tools[0].endTime).toBe(Date.parse("2026-06-03T12:00:02.500Z"));
+  });
+
   it("parses custom tool calls and their outputs", () => {
     const lines: RolloutLine[] = [
       { timestamp: "2026-06-03T12:00:00.000Z", type: "session_meta", payload: { id: "s" } },
